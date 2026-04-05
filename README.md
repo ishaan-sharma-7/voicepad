@@ -139,6 +139,69 @@ The vocab file is hot-reloaded on every transcription — no restart needed.
 
 ---
 
+## Auto-launch on login (optional)
+
+VoicePad runs fine by launching it manually in a terminal. If you want it to start automatically on login, pick one of the options below.
+
+### Option 1: launchd plist (no third-party dependencies)
+
+Create `~/Library/LaunchAgents/com.voicepad.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>             <string>com.voicepad</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/voicepad/venv/bin/python</string>
+    <string>/path/to/voicepad/voicepad.py</string>
+  </array>
+  <key>RunAtLoad</key>         <true/>
+  <key>KeepAlive</key>         <true/>
+  <key>StandardOutPath</key>   <string>/tmp/voicepad.log</string>
+  <key>StandardErrorPath</key> <string>/tmp/voicepad.log</string>
+</dict>
+</plist>
+```
+
+Replace both `/path/to/voicepad` entries with your actual paths, then load it:
+
+```bash
+launchctl load ~/Library/LaunchAgents/com.voicepad.plist
+```
+
+`KeepAlive` means launchd will automatically restart VoicePad if it ever crashes.
+
+### Option 2: Hammerspoon (if you already use it)
+
+If you have [Hammerspoon](https://www.hammerspoon.org) installed, add this to your `~/.hammerspoon/init.lua`:
+
+```lua
+-- Auto-launch VoicePad on login and restart it if it exits
+local voicepadTask = nil
+
+local function startVoicePad()
+  voicepadTask = hs.task.new(
+    "/path/to/voicepad/venv/bin/python",
+    function(exitCode, stdOut, stdErr)
+      -- Restart on exit (e.g. crash)
+      hs.timer.doAfter(2, startVoicePad)
+    end,
+    { "/path/to/voicepad/voicepad.py" }
+  )
+  voicepadTask:start()
+end
+
+startVoicePad()
+```
+
+Replace both `/path/to/voicepad` entries with your actual paths and reload your Hammerspoon config.
+
+---
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
