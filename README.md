@@ -4,6 +4,15 @@ A lightweight macOS voice-dictation overlay powered by [mlx-whisper](https://git
 
 Press **Right ⌘** to start/stop recording. Text is transcribed locally, optionally cleaned up by a local LLM, and pasted directly into whatever app is in focus.
 
+## Privacy
+
+VoicePad never stores or transmits your audio.
+
+- **Warmup stream** — to eliminate the lag when switching Bluetooth audio devices (e.g. AirPods) into recording mode, VoicePad keeps a silent microphone stream open at all times. Every audio chunk from this stream is immediately discarded in memory — it is never written to disk, never buffered, and never leaves your machine.
+- **Recording** — audio is only actively captured while you hold Right ⌘. The raw PCM data lives in RAM for the duration of transcription, then is released.
+- **Transcription** — runs entirely on-device via Apple's MLX framework. No audio or text is sent to any external server.
+- **LLM post-processing** — if enabled, the transcript is sent to a local [Ollama](https://ollama.com) instance running on your machine. Nothing leaves localhost.
+
 ---
 
 ## Requirements
