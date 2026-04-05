@@ -74,7 +74,7 @@ SAMPLE_RATE  = 16_000
 CHANNELS     = 1
 DTYPE        = "float32"
 OLLAMA_URL   = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "qwen2.5:14b"
+OLLAMA_MODEL = ""   # Set to any model you have pulled, e.g. "llama3.2:3b" or "mistral:7b"
 MLX_MODEL    = "mlx-community/whisper-small.en-mlx"
 AUTOHIDE_SEC = 1.2
 
@@ -186,13 +186,6 @@ SYSTEM_PROMPTS = {
         "   [Closing line, e.g. 'Thanks,' — match their tone]\n"
         "4. Do not add content not said. No subject line.\n"
         "Output only the email body."
-    ),
-    "message": (
-        "Minimal editor for a voice-dictated message (Slack/iMessage/text). Rules:\n"
-        "1. Keep sender's words and tone exactly — do not rewrite.\n"
-        "2. Fix only: typos, filler words, run-ons.\n"
-        "3. Short and conversational. One paragraph max.\n"
-        "Output only the message text."
     ),
     "notes": (
         "Convert voice-dictated text to structured notes. Rules:\n"
