@@ -57,7 +57,8 @@ try:
         NSFontAttributeName, NSForegroundColorAttributeName,
         NSMakeRect, NSMakePoint,
         NSBackingStoreBuffered, NSWindowStyleMaskBorderless,
-        NSFloatingWindowLevel, NSNonactivatingPanelMask,
+        NSFloatingWindowLevel, NSStatusWindowLevel,
+        NSNonactivatingPanelMask,
         NSPanel, NSWindowCollectionBehaviorCanJoinAllSpaces,
         NSWindowCollectionBehaviorStationary,
         NSWindowCollectionBehaviorFullScreenAuxiliary,
@@ -604,11 +605,12 @@ if HAVE_APPKIT:
                 NSMakeRect(x, y, W, H),
                 NSWindowStyleMaskBorderless | NSNonactivatingPanelMask,
                 NSBackingStoreBuffered, False)
-            win.setLevel_(NSFloatingWindowLevel + 2)
+            win.setLevel_(NSStatusWindowLevel)
             win.setOpaque_(False)
             win.setBackgroundColor_(NSColor.clearColor())
             win.setAlphaValue_(0.97)
             win.setHasShadow_(True)
+            win.setHidesOnDeactivate_(False)
             win.setCollectionBehavior_(
                 NSWindowCollectionBehaviorCanJoinAllSpaces |
                 NSWindowCollectionBehaviorStationary |
@@ -635,8 +637,16 @@ if HAVE_APPKIT:
                         x  = (sf.size.width - W) / 2
                         y  = 90
                         self.win.setFrameOrigin_(NSMakePoint(x, y))
+                        # Re-assert level + spaces behavior every show: macOS
+                        # occasionally drops these after sleep/wake or when
+                        # another app goes fullscreen, which is why the panel
+                        # can land on the wrong Space until Hammerspoon restarts us.
+                        self.win.setLevel_(NSStatusWindowLevel)
+                        self.win.setCollectionBehavior_(
+                            NSWindowCollectionBehaviorCanJoinAllSpaces |
+                            NSWindowCollectionBehaviorStationary |
+                            NSWindowCollectionBehaviorFullScreenAuxiliary)
                         self.win.orderFrontRegardless()
-                        self.win.setLevel_(NSFloatingWindowLevel + 2)
                     elif cmd == "hide": self.win.orderOut_(None)
                     elif cmd == "wave": self.view.set_wave(msg[1])
                     elif cmd == "dot":  self.view.set_state(msg[1], msg[2])
@@ -650,7 +660,11 @@ if HAVE_APPKIT:
 
         def run(self):
             app = NSApplication.sharedApplication()
-            app.setActivationPolicy_(2)
+            # Accessory (1), not Prohibited (2): Prohibited apps are documented
+            # as "may not create windows" and have unreliable Spaces behavior,
+            # which causes the panel to land on the wrong Space behind fullscreen
+            # Chrome. Accessory still keeps us out of the Dock.
+            app.setActivationPolicy_(1)
             self._make_window()
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 0.033, self, "tick:", None, True)
