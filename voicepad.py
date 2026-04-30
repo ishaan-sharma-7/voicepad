@@ -469,12 +469,22 @@ class AudioRecorder:
         return audio
 
     def stop(self):
+        # Detach the stream under the lock so prewarm() can't race with us,
+        # but DO NOT hold the lock through stream.stop(). PortAudio's
+        # stop() blocks until the in-flight _cb returns, and _cb itself
+        # acquires self._lock — holding it here would deadlock the audio
+        # thread against the main thread, which presents as the process
+        # hanging and getting SIGKILLed by macOS ("Python quit unexpectedly").
         with self._lock:
-            if self._stream:
-                try: self._stream.stop(); self._stream.close()
-                except Exception: pass
-                self._stream = None
+            stream = self._stream
+            self._stream = None
             self._active = False
+        if stream:
+            try: stream.stop(); stream.close()
+            except Exception: pass
+        # After stream.stop() returns, _cb will not fire again — safe to
+        # reacquire the lock and drain the captured frames.
+        with self._lock:
             if self._frames:
                 audio = np.concatenate(self._frames)
             else:
