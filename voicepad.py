@@ -57,14 +57,14 @@ try:
         NSFontAttributeName, NSForegroundColorAttributeName,
         NSMakeRect, NSMakePoint,
         NSBackingStoreBuffered, NSWindowStyleMaskBorderless,
-        NSFloatingWindowLevel, NSStatusWindowLevel,
+        NSFloatingWindowLevel, NSStatusWindowLevel, NSPopUpMenuWindowLevel,
         NSNonactivatingPanelMask,
         NSPanel, NSWindowCollectionBehaviorCanJoinAllSpaces,
         NSWindowCollectionBehaviorStationary,
         NSWindowCollectionBehaviorFullScreenAuxiliary,
-        NSTimer, NSScreen,
+        NSTimer, NSScreen, NSWorkspace,
     )
-    from Foundation import NSObject
+    from Foundation import NSObject, NSNotificationCenter
     HAVE_APPKIT = True
 except Exception as e:
     print(f"[voicepad] AppKit unavailable ({e}), using tkinter")
@@ -361,14 +361,23 @@ class AudioRecorder:
         This forces Bluetooth HFP negotiation to happen now,
         so when the user presses the hotkey the mic is already live."""
         try:
-            # device=None always uses whatever macOS currently has as default input
-            # This correctly picks AirPods if they're set in System Settings -> Sound -> Input
-            info = sd.query_devices(None, 'input')
-            print(f"[voicepad] mic pre-warmed: {info['name']}")
-            self._warmup = sd.InputStream(
-                samplerate=SAMPLE_RATE, channels=CHANNELS,
-                dtype=DTYPE, callback=self._warmup_cb, blocksize=512, device=None)
-            self._warmup.start()
+            with self._lock:
+                # Don't disturb an active recording, and don't race with a
+                # concurrent start() that's opening the recording stream.
+                if self._active:
+                    return
+                if self._warmup:
+                    try: self._warmup.stop(); self._warmup.close()
+                    except Exception: pass
+                    self._warmup = None
+                # device=None always uses whatever macOS currently has as default input
+                # This correctly picks AirPods if they're set in System Settings -> Sound -> Input
+                info = sd.query_devices(None, 'input')
+                print(f"[voicepad] mic pre-warmed: {info['name']}")
+                self._warmup = sd.InputStream(
+                    samplerate=SAMPLE_RATE, channels=CHANNELS,
+                    dtype=DTYPE, callback=self._warmup_cb, blocksize=512, device=None)
+                self._warmup.start()
         except Exception as e:
             print(f"[voicepad] prewarm failed ({e}) — mic will have slight delay")
 
@@ -380,20 +389,28 @@ class AudioRecorder:
         with self._lock:
             self._frames = []; self._silence_ct = 0
             self._speaking = False; self._active = True
-        # close warmup stream and open the real recording stream
-        if self._warmup:
-            try: self._warmup.stop(); self._warmup.close()
-            except Exception: pass
-            self._warmup = None
-        try:
-            info = sd.query_devices(None, 'input')
-            print(f"[voicepad] recording: {info['name']}")
-        except Exception:
-            pass
-        # device=None = always use current macOS default input (AirPods, built-in, etc)
-        self._stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
-            dtype=DTYPE, callback=self._cb, blocksize=512, device=None)
-        self._stream.start()
+            # close warmup stream before refreshing PortAudio
+            if self._warmup:
+                try: self._warmup.stop(); self._warmup.close()
+                except Exception: pass
+                self._warmup = None
+            # Refresh PortAudio's device cache. PortAudio enumerates devices
+            # once at Pa_Initialize, so after AirPods (or any input) drops and
+            # rejoins, device=None still resolves to the stale handle and
+            # recordings come up empty until the process is restarted.
+            try:
+                sd._terminate(); sd._initialize()
+            except Exception as e:
+                print(f"[voicepad] PortAudio refresh failed ({e})")
+            try:
+                info = sd.query_devices(None, 'input')
+                print(f"[voicepad] recording: {info['name']}")
+            except Exception:
+                pass
+            # device=None = always use current macOS default input (AirPods, built-in, etc)
+            self._stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
+                dtype=DTYPE, callback=self._cb, blocksize=512, device=None)
+            self._stream.start()
 
     def _cb(self, indata, *_):
         chunk = indata.copy().flatten()
@@ -421,9 +438,17 @@ class AudioRecorder:
         return audio
 
     def stop(self):
-        if self._stream:
-            self._stream.stop(); self._stream.close(); self._stream = None
-        audio = self.flush()
+        with self._lock:
+            if self._stream:
+                try: self._stream.stop(); self._stream.close()
+                except Exception: pass
+                self._stream = None
+            self._active = False
+            if self._frames:
+                audio = np.concatenate(self._frames)
+            else:
+                audio = np.array([], dtype=DTYPE)
+            self._frames = []; self._silence_ct = 0; self._speaking = False
         # re-open warmup stream so next recording has no delay
         threading.Thread(target=self.prewarm, daemon=True).start()
         return audio
@@ -597,27 +622,65 @@ if HAVE_APPKIT:
             self._ctrl = None
             return self
 
+        def _panel_origin(self):
+            # visibleFrame() excludes menu bar / Dock; origin includes the
+            # screen's global offset, so multi-monitor setups (and post-
+            # unplug/replug states) place the panel on the correct screen
+            # rather than off in dead space — which presented as the panel
+            # being "behind everything".
+            sf = NSScreen.mainScreen().visibleFrame()
+            x  = sf.origin.x + (sf.size.width - W) / 2
+            y  = sf.origin.y + 90
+            return NSMakePoint(x, y)
+
+        def _apply_window_traits(self):
+            # NSPopUpMenuWindowLevel (101) is reliably above fullscreen-app
+            # contents on every macOS version we care about; NSStatusWindowLevel
+            # (25) was sometimes covered by fullscreen Chrome.
+            self.win.setLevel_(NSPopUpMenuWindowLevel)
+            self.win.setCollectionBehavior_(
+                NSWindowCollectionBehaviorCanJoinAllSpaces |
+                NSWindowCollectionBehaviorStationary |
+                NSWindowCollectionBehaviorFullScreenAuxiliary)
+
         def _make_window(self):
-            sf  = NSScreen.mainScreen().frame()
-            x   = (sf.size.width - W) / 2
-            y   = 90
+            origin = self._panel_origin()
             win = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
-                NSMakeRect(x, y, W, H),
+                NSMakeRect(origin.x, origin.y, W, H),
                 NSWindowStyleMaskBorderless | NSNonactivatingPanelMask,
                 NSBackingStoreBuffered, False)
-            win.setLevel_(NSStatusWindowLevel)
             win.setOpaque_(False)
             win.setBackgroundColor_(NSColor.clearColor())
             win.setAlphaValue_(0.97)
             win.setHasShadow_(True)
             win.setHidesOnDeactivate_(False)
-            win.setCollectionBehavior_(
-                NSWindowCollectionBehaviorCanJoinAllSpaces |
-                NSWindowCollectionBehaviorStationary |
-                NSWindowCollectionBehaviorFullScreenAuxiliary)
             self.view = VoiceView.alloc().initWithFrame_(NSMakeRect(0, 0, W, H))
             win.setContentView_(self.view)
             self.win = win
+            self._apply_window_traits()
+            # Observe screen reconfig + wake so the panel survives without a
+            # process restart. Both can drop level/collection behavior or
+            # leave the panel mispositioned on a now-unplugged screen.
+            NSNotificationCenter.defaultCenter(
+            ).addObserver_selector_name_object_(
+                self, "screenParamsChanged:",
+                "NSApplicationDidChangeScreenParametersNotification", None)
+            NSWorkspace.sharedWorkspace().notificationCenter(
+            ).addObserver_selector_name_object_(
+                self, "didWake:",
+                "NSWorkspaceDidWakeNotification", None)
+
+        def screenParamsChanged_(self, _):
+            self._apply_window_traits()
+            try:
+                self.win.setFrameOrigin_(self._panel_origin())
+                if self.win.isVisible():
+                    self.win.orderFrontRegardless()
+            except Exception:
+                pass
+
+        def didWake_(self, _):
+            self._apply_window_traits()
 
         def is_visible(self):
             try: return bool(self.win.isVisible())
@@ -633,19 +696,14 @@ if HAVE_APPKIT:
                 while True:
                     msg = self._q.get_nowait(); cmd = msg[0]
                     if cmd == "show":
-                        sf = NSScreen.mainScreen().frame()
-                        x  = (sf.size.width - W) / 2
-                        y  = 90
-                        self.win.setFrameOrigin_(NSMakePoint(x, y))
-                        # Re-assert level + spaces behavior every show: macOS
-                        # occasionally drops these after sleep/wake or when
-                        # another app goes fullscreen, which is why the panel
-                        # can land on the wrong Space until Hammerspoon restarts us.
-                        self.win.setLevel_(NSStatusWindowLevel)
-                        self.win.setCollectionBehavior_(
-                            NSWindowCollectionBehaviorCanJoinAllSpaces |
-                            NSWindowCollectionBehaviorStationary |
-                            NSWindowCollectionBehaviorFullScreenAuxiliary)
+                        # orderOut first so the WindowServer fully re-evaluates
+                        # stacking/Space membership on re-show. Re-asserting on
+                        # an already-visible-but-stuck window doesn't always
+                        # un-stick it, which is why the panel previously
+                        # required a full restart to recover.
+                        self.win.orderOut_(None)
+                        self.win.setFrameOrigin_(self._panel_origin())
+                        self._apply_window_traits()
                         self.win.orderFrontRegardless()
                     elif cmd == "hide": self.win.orderOut_(None)
                     elif cmd == "wave": self.view.set_wave(msg[1])
