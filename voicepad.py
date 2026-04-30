@@ -749,11 +749,13 @@ if HAVE_APPKIT:
 
         def run(self):
             app = NSApplication.sharedApplication()
-            # Accessory (1), not Prohibited (2): Prohibited apps are documented
-            # as "may not create windows" and have unreliable Spaces behavior,
-            # which causes the panel to land on the wrong Space behind fullscreen
-            # Chrome. Accessory still keeps us out of the Dock.
-            app.setActivationPolicy_(1)
+            # Prohibited (2): no Dock icon, no Cmd+Tab entry, and crucially
+            # no "Python" in the menu bar when frontmost. Accessory (1) was
+            # tried previously to fix panel-behind-fullscreen, but the other
+            # fixes here (NSPopUpMenuWindowLevel + FullScreenAuxiliary +
+            # screen-change/wake observers + orderOut→re-assert→front show
+            # sequence) make Accessory unnecessary for that case.
+            app.setActivationPolicy_(2)
             self._make_window()
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 0.033, self, "tick:", None, True)
