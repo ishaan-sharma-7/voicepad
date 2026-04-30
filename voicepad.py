@@ -12,7 +12,26 @@ import math
 import random
 import sys
 import os
+import signal
 import subprocess
+
+
+def _hard_exit(*_):
+    """Skip atexit handlers when the process is asked to terminate.
+
+    Some dylibs in Python's environment (e.g. libggml-metal, dlopened by
+    transitive deps of mlx/whisper backends) call abort() from their
+    destructor during __cxa_finalize_ranges. That fires SIGABRT inside
+    a clean shutdown and macOS reports it as "Python quit unexpectedly"
+    every time Hammerspoon reloads us. We have nothing critical to flush
+    on exit (audio streams and the panel are released by the OS), so we
+    bypass cleanup entirely on signal- or AppleEvent-driven termination.
+    """
+    os._exit(0)
+
+
+signal.signal(signal.SIGTERM, _hard_exit)
+signal.signal(signal.SIGINT, _hard_exit)
 
 try:
     import sounddevice as sd
@@ -723,6 +742,15 @@ if HAVE_APPKIT:
         def didWake_(self, _):
             self._apply_window_traits()
 
+        def applicationShouldTerminate_(self, _):
+            # Intercept the AppleEvent-Quit path (e.g. when Hammerspoon's
+            # task termination or any AE Quit reaches us) and exit before
+            # NSApplication's clean shutdown invokes __cxa_finalize_ranges,
+            # which triggers libggml-metal's abort(). _hard_exit never
+            # returns, so the NSTerminateReply value below is unreachable.
+            _hard_exit()
+            return 0
+
         def is_visible(self):
             try: return bool(self.win.isVisible())
             except: return False
@@ -766,6 +794,10 @@ if HAVE_APPKIT:
             # screen-change/wake observers + orderOut→re-assert→front show
             # sequence) make Accessory unnecessary for that case.
             app.setActivationPolicy_(2)
+            # Become the NSApp delegate so applicationShouldTerminate_ fires
+            # on AE Quit — this is the path the libggml-metal abort travels
+            # through (see crash trace: _handleAEQuit → terminate: → exit).
+            app.setDelegate_(self)
             self._make_window()
             NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 0.033, self, "tick:", None, True)
