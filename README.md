@@ -139,6 +139,32 @@ The vocab file is hot-reloaded on every transcription — no restart needed.
 
 ---
 
+## Standalone `.app` bundle (optional)
+
+If you'd rather install VoicePad as a regular macOS app — no menu-bar `Python` entry, no Cmd+Tab listing, no dependency on whatever Python your shell happens to resolve — you can build a self-contained `.app` from the included [setup.py](setup.py).
+
+**Why bother:** the bundle has its own embedded Python interpreter and only ships voicepad's actual dependencies. If your system Python's site-packages is "polluted" with something that misbehaves at process exit (e.g. `llama-cpp-python` whose `libggml-metal` destructor calls `abort()` and produces a *Python quit unexpectedly* dialog every time the process is killed), the bundle is fully insulated from it.
+
+```bash
+# Build environment — use a fresh venv, py2app needs a working pip
+python3.11 -m venv /tmp/voicepad-build
+/tmp/voicepad-build/bin/pip install -r requirements.txt py2app
+
+# Build (produces dist/VoicePad.app, ~1 GB)
+/tmp/voicepad-build/bin/python setup.py py2app
+
+# Install to ~/Applications and ad-hoc-sign so macOS will run it
+mkdir -p ~/Applications
+cp -R dist/VoicePad.app ~/Applications/
+codesign --force --deep --sign - ~/Applications/VoicePad.app
+```
+
+First launch will prompt for **Microphone** and **Accessibility** access — grant both. The bundle is registered as `com.voicepad.app` (a separate identity from a raw Python script), so any earlier permissions granted to "Python" don't carry over.
+
+`Info.plist` sets `LSUIElement=YES` so the app is hidden from the Dock, menu bar, and Cmd+Tab — it just shows the floating panel when you press Right ⌘.
+
+---
+
 ## Auto-launch on login (optional)
 
 VoicePad runs fine by launching it manually in a terminal. If you want it to start automatically on login, pick one of the options below.
@@ -199,6 +225,22 @@ startVoicePad()
 ```
 
 Replace both `/path/to/voicepad` entries with your actual paths and reload your Hammerspoon config.
+
+If you built the `.app` bundle (see above), point Hammerspoon at its inner binary instead:
+
+```lua
+local function startVoicePad()
+  hs.task.new(
+    "/Users/yourname/Applications/VoicePad.app/Contents/MacOS/VoicePad",
+    function(exitCode, stdOut, stdErr)
+      hs.timer.doAfter(3, startVoicePad)
+    end,
+    {}
+  ):start()
+end
+
+startVoicePad()
+```
 
 ---
 
