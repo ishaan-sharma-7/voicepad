@@ -15,6 +15,18 @@ import os
 import signal
 import subprocess
 
+# When running as a py2app bundle, py2app puts lib/python311.zip and
+# lib/python3.11/lib-dynload on sys.path but NOT lib/python3.11/ itself.
+# Our mlx namespace package's Python sources live at lib/python3.11/mlx/
+# (post-build copy from setup.py), so without adding that parent dir
+# Python finds only lib-dynload/mlx/core.so and trips on a missing
+# `mlx._reprlib_fix` import. Adding the path here makes the full
+# namespace visible.
+if os.environ.get('RESOURCEPATH'):
+    _bundled_lib = os.path.join(os.environ['RESOURCEPATH'], 'lib', 'python3.11')
+    if _bundled_lib not in sys.path:
+        sys.path.insert(0, _bundled_lib)
+
 
 def _hard_exit(*_):
     """Skip atexit handlers when the process is asked to terminate.
@@ -787,13 +799,19 @@ if HAVE_APPKIT:
 
         def run(self):
             app = NSApplication.sharedApplication()
-            # Prohibited (2): no Dock icon, no Cmd+Tab entry, and crucially
-            # no "Python" in the menu bar when frontmost. Accessory (1) was
-            # tried previously to fix panel-behind-fullscreen, but the other
-            # fixes here (NSPopUpMenuWindowLevel + FullScreenAuxiliary +
-            # screen-change/wake observers + orderOut→re-assert→front show
-            # sequence) make Accessory unnecessary for that case.
-            app.setActivationPolicy_(2)
+            # When running inside the py2app bundle, LSUIElement=YES in
+            # Info.plist already hides us from the Dock / menu bar / Cmd+Tab,
+            # AND Prohibited (2) at runtime breaks Metal access (mlx fails to
+            # initialize its extension). So we only set Prohibited for the
+            # raw-script invocation; the .app uses Accessory (1, the default
+            # under LSUIElement) which keeps Metal working.
+            if os.environ.get('RESOURCEPATH'):
+                # py2app bundle — Info.plist's LSUIElement handles visibility.
+                pass
+            else:
+                # Raw script (e.g. Hammerspoon launching python directly):
+                # Prohibited keeps "Python" out of the menu bar.
+                app.setActivationPolicy_(2)
             # Become the NSApp delegate so applicationShouldTerminate_ fires
             # on AE Quit — this is the path the libggml-metal abort travels
             # through (see crash trace: _handleAEQuit → terminate: → exit).
