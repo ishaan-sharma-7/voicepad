@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-VoicePad v6
-Right Cmd = start/stop  |  Tab = cycle mode (only when visible)  |  Esc = cancel
-Status dot: grey (idle) -> red (recording) -> green (done)
+VoicePad v7
+Trigger key (default Right Cmd) = start/stop  |  Esc = cancel
+Raw transcription only — mic is opt-in (open solely while recording).
 """
 
 import threading
@@ -62,20 +62,6 @@ except ImportError:
     sys.exit("pip install pynput")
 
 try:
-    from Quartz import (
-        CGEventTapCreate, CGEventTapEnable,
-        CFMachPortCreateRunLoopSource, CFRunLoopAddSource,
-        kCGSessionEventTap, kCGHeadInsertEventTap,
-        kCGEventKeyDown, CGEventGetIntegerValueField,
-        kCGKeyboardEventKeycode,
-    )
-    from CoreFoundation import CFRunLoopGetMain, kCFRunLoopCommonModes
-    HAVE_QUARTZ = True
-except Exception as _qe:
-    print(f"[voicepad] Quartz unavailable, tab suppression disabled")
-    HAVE_QUARTZ = False
-
-try:
     import requests
 except ImportError:
     sys.exit("pip install requests")
@@ -107,18 +93,70 @@ except Exception as e:
     HAVE_APPKIT = False
 
 # ── config ────────────────────────────────────────────────────────────────────
+import json, re
+
 SAMPLE_RATE  = 16_000
 CHANNELS     = 1
 DTYPE        = "float32"
-OLLAMA_URL   = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "gemma4:e2b"   # Any model you have pulled; gemma4:e2b is small and fast
-MLX_MODEL    = "mlx-community/whisper-small.en-mlx"
 AUTOHIDE_SEC = 0.3
 
-MODES      = ["raw", "email", "notes"]
+# User config — created with defaults on first run, edit and restart to apply.
+CONFIG_PATH = os.path.expanduser("~/.voicepad/config.json")
+
+DEFAULT_CONFIG = {
+    # pynput key name ("cmd_r", "alt_r", "f19", ...) or a single character.
+    "hotkey": "cmd_r",
+    # "builtin" records from the Mac's internal mic even when AirPods are
+    # connected — it opens instantly (no Bluetooth HFP negotiation) and
+    # sounds better than the HFP telephone codec. "default" follows the
+    # system default input device instead; expect the first words to be
+    # clipped while a Bluetooth mic renegotiates.
+    "input_device": "builtin",
+    # Remote transcription server (e.g. the office Mac Mini):
+    #   "http://macmini.local:8765/transcribe"
+    # Empty = transcribe locally on this machine.
+    "transcribe_url": "",
+    # Load the local Whisper model even when transcribe_url is set, so
+    # dictation keeps working if the server is unreachable. Set false for
+    # a thin client (no model download, no RAM cost).
+    "local_fallback": True,
+    "mlx_model": "mlx-community/whisper-small.en-mlx",
+}
+
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if os.path.exists(CONFIG_PATH):
+        try:
+            with open(CONFIG_PATH) as f:
+                cfg.update(json.load(f))
+        except Exception as e:
+            print(f"[voicepad] bad config.json ({e}), using defaults")
+    else:
+        try:
+            os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+            with open(CONFIG_PATH, "w") as f:
+                json.dump(DEFAULT_CONFIG, f, indent=2)
+        except Exception:
+            pass
+    return cfg
+
+CONFIG         = load_config()
+MLX_MODEL      = CONFIG["mlx_model"]
+TRANSCRIBE_URL = (CONFIG["transcribe_url"] or "").strip()
+
+def resolve_hotkey():
+    name = str(CONFIG.get("hotkey", "cmd_r"))
+    key = getattr(kb_input.Key, name, None)
+    if key is not None:
+        return key
+    if len(name) == 1:
+        return kb_input.KeyCode.from_char(name)
+    print(f"[voicepad] unknown hotkey {name!r}, falling back to cmd_r")
+    return kb_input.Key.cmd_r
+
+HOTKEY = resolve_hotkey()
 
 # ── vocab config ──────────────────────────────────────────────────────────────
-import json, re
 VOCAB_PATH = os.path.expanduser("~/.voicepad/vocab.json")
 
 DEFAULT_VOCAB = {
@@ -156,101 +194,6 @@ def apply_vocab(text: str) -> str:
         text = pattern.sub(right, text)
     return text
 
-# ── context awareness ─────────────────────────────────────────────────────────
-# Bundle IDs → mode auto-selection
-NOTES_BUNDLE_IDS = {
-    "com.apple.Notes",
-}
-
-GMAIL_URL_PATTERNS = [
-    "mail.google.com",
-    "gmail.com",
-]
-
-def get_frontmost_bundle_id() -> str:
-    """Get the bundle ID of the currently focused app via AppleScript."""
-    try:
-        result = subprocess.run(
-            ["osascript", "-e",
-             'tell application "System Events" to return bundle identifier of first process whose frontmost is true'],
-            capture_output=True, text=True, timeout=1)
-        return result.stdout.strip()
-    except Exception:
-        return ""
-
-def get_chrome_active_url() -> str:
-    """Get the URL of the active Chrome tab via AppleScript."""
-    try:
-        result = subprocess.run(
-            ["osascript", "-e",
-             'tell application "Google Chrome" to return URL of active tab of front window'],
-            capture_output=True, text=True, timeout=1)
-        return result.stdout.strip()
-    except Exception:
-        return ""
-
-def detect_context_mode() -> int | None:
-    """
-    Returns a mode index if context matches, None if no auto-switch needed.
-    Only auto-switches to email (Gmail) or notes (Notes/Raycast).
-    """
-    bundle = get_frontmost_bundle_id()
-
-    # Notes app or Raycast → notes mode
-    if bundle in NOTES_BUNDLE_IDS:
-        return MODES.index("notes")
-
-    # Chrome → check if Gmail is active tab
-    if bundle in ("com.google.Chrome", "org.chromium.Chromium"):
-        url = get_chrome_active_url()
-        if any(p in url for p in GMAIL_URL_PATTERNS):
-            return MODES.index("email")
-
-    return None
-MODE_SHORT = {"raw": "Default", "email": "Email", "notes": "Notes"}
-
-SYSTEM_PROMPTS = {
-    "raw": None,
-    "email": (
-        "You edit a voice-dictated email. Output ONLY the email body — no subject, no preamble, no explanation.\n\n"
-        "Format:\n"
-        "  [greeting line]\n"
-        "  \n"
-        "  [body, 1-3 short paragraphs]\n"
-        "  \n"
-        "  [closing line]\n\n"
-        "Rules:\n"
-        "1. Fix grammar, run-ons, and filler words (uh, um, like, you know, \"wait actually let me start over\").\n"
-        "2. Match the sender's tone EXACTLY — do not formalize. Look at how they greeted you:\n"
-        "   - Casual openers (\"yo\", \"hey\", \"dude\", \"lol\", \"sup\") → casual greeting (\"Yo\", \"Hey\") and casual closing (\"Cheers,\", \"Later,\", \"Talk soon,\").\n"
-        "   - Neutral openers (\"hi\", \"hello\") → \"Hi [name],\" and \"Thanks,\".\n"
-        "   - Never use \"Dear\".\n"
-        "3. Keep the sender's exact words and meaning. Do not add content they did not say.\n"
-        "4. For one-line messages (heads-ups, quick asks), keep the body to one short sentence.\n"
-    ),
-    "notes": (
-        "Convert voice-dictated text to bullet-point notes. Output ONLY the notes — no preamble, no explanation.\n\n"
-        "Rules:\n"
-        "1. One idea per bullet (use `* `).\n"
-        "2. Sub-bullets (indented `  * `) for details under a parent idea.\n"
-        "3. ADD a **bold header** at the top when EITHER is true:\n"
-        "   - The input starts with a topical phrase (e.g. \"thoughts on X\", \"X takeaways\", \"ideas for Y\", \"plan for Z\", \"prep for X\", \"notes from X\"). Use that phrase as the header.\n"
-        "   - The notes contain 3 or more distinct topics.\n"
-        "4. PRESERVE meaning exactly. NEVER drop or invert negatives or instructions like \"skip\", \"don't\", \"no\", \"avoid\". If the speaker said \"skip X\", the note must say \"Skip X\" — not \"do X\".\n"
-        "5. Fix obvious transcription errors only. Do not invent, rephrase, or add content.\n\n"
-        "Examples:\n\n"
-        "Input: design review takeaways the new dashboard got positive feedback we need to fix mobile loading\n"
-        "Output:\n"
-        "**Design review takeaways**\n"
-        "* New dashboard got positive feedback\n"
-        "* Need to fix mobile loading\n\n"
-        "Input: buy milk and eggs\n"
-        "Output:\n"
-        "* Buy milk\n"
-        "* Buy eggs\n"
-    ),
-}
-
 # ── window geometry ───────────────────────────────────────────────────────────
 # Small Wispr-Flow-style pill: just a waveform inside a rounded capsule.
 W        = 148
@@ -265,14 +208,6 @@ WAVE_A   = (0.86,  0.86,  0.88,  1.0)
 WAVE_D   = (0.19,  0.19,  0.21,  1.0)
 DOT_GREY = (0.55,  0.55,  0.60,  1.0)
 DOT_GRN  = (0.22,  0.82,  0.46,  1.0)
-
-# Mode → rim color. Memorize the mode by the capsule's outline:
-#   default = no color (subtle gray), email = blue, notes = yellow
-MODE_RIM = {
-    "raw":   BORDER,
-    "email": (0.36, 0.58, 0.98, 0.95),
-    "notes": (0.95, 0.78, 0.25, 0.95),
-}
 
 DOT_STATE_IDLE = "idle"
 DOT_STATE_REC  = "rec"
@@ -304,6 +239,15 @@ _fw_model = None
 
 def load_transcription_model():
     global _mlx_ok, _fw_model
+    if TRANSCRIBE_URL:
+        try:
+            health = TRANSCRIBE_URL.rsplit("/", 1)[0] + "/health"
+            r = requests.get(health, timeout=3)
+            print(f"[voicepad] remote transcription ready: {r.json()}")
+        except Exception as e:
+            print(f"[voicepad] remote server unreachable ({e})")
+        if not CONFIG.get("local_fallback", True):
+            return
     try:
         import mlx_whisper
         dummy = np.zeros(SAMPLE_RATE, dtype=np.float32)
@@ -339,49 +283,74 @@ def _is_hallucination(text: str) -> bool:
             return True
     return False
 
+def transcribe_remote(audio_np):
+    """POST raw 16 kHz mono float32 PCM; the server returns {"text": ...}."""
+    r = requests.post(
+        TRANSCRIBE_URL,
+        data=audio_np.astype(np.float32).tobytes(),
+        headers={"Content-Type": "application/octet-stream"},
+        timeout=30)
+    r.raise_for_status()
+    return r.json().get("text", "").strip()
+
 def transcribe(audio_np):
-    if _mlx_ok:
+    text = None
+    if TRANSCRIBE_URL:
+        try:
+            text = transcribe_remote(audio_np)
+        except Exception as e:
+            print(f"[voicepad] remote transcribe failed ({e}), trying local")
+    if text is None and _mlx_ok:
         try:
             import mlx_whisper
             r = mlx_whisper.transcribe(audio_np, path_or_hf_repo=MLX_MODEL, language="en")
             text = r.get("text", "").strip()
-            if _is_hallucination(text):
-                return ""
-            return apply_vocab(text)
         except Exception as e:
             print(f"[voicepad] mlx error: {e}")
-    if _fw_model:
+    if text is None and _fw_model:
         segs, _ = _fw_model.transcribe(audio_np, language="en", beam_size=5, vad_filter=True)
         text = " ".join(s.text.strip() for s in segs).strip()
-        if _is_hallucination(text):
-            return ""
-        return apply_vocab(text)
-    return ""
-
-def ollama_post(raw, mode):
-    prompt = SYSTEM_PROMPTS.get(mode)
-    if not prompt:
-        return raw
-    try:
-        r = requests.post(OLLAMA_URL, json={
-            "model": OLLAMA_MODEL, "system": prompt,
-            "prompt": raw, "stream": False,
-        }, timeout=60)
-        r.raise_for_status()
-        return r.json().get("response", raw).strip()
-    except Exception as e:
-        return f"[Ollama error: {e}]\n\n{raw}"
+    if not text or _is_hallucination(text):
+        return ""
+    return apply_vocab(text)
 
 # ── silence detection ─────────────────────────────────────────────────────────
 SILENCE_RMS_THRESHOLD = 0.008
 SILENCE_FRAMES_NEEDED = 45
 MIN_CHUNK_FRAMES      = 15
 
+def resolve_input_device():
+    """Index of the configured input device, or None for the system default.
+
+    "builtin" pins the Mac's internal microphone. The mic is opt-in — it is
+    only open while actually recording — so the device must open instantly;
+    the internal mic does, while a Bluetooth default (AirPods) spends ~1s
+    renegotiating HFP on every open."""
+    if CONFIG.get("input_device") != "builtin":
+        return None
+    try:
+        for i, d in enumerate(sd.query_devices()):
+            name = d["name"].lower()
+            if d["max_input_channels"] > 0 and (
+                    "built-in" in name or "macbook" in name
+                    or "imac" in name or "mac mini" in name
+                    or "mac studio" in name):
+                return i
+    except Exception:
+        pass
+    return None
+
 class AudioRecorder:
+    """Opt-in microphone: no stream exists outside start()..stop().
+
+    (An earlier version held a silent "warmup" stream open 24/7 to
+    pre-negotiate Bluetooth HFP. Removed for privacy — the mic must be
+    verifiably off when not dictating. Use input_device="builtin" to keep
+    recording start instant with AirPods connected.)"""
+
     def __init__(self):
         self._frames     = []
         self._stream     = None
-        self._warmup     = None   # always-open stream to pre-negotiate BT HFP
         self._lock       = threading.Lock()
         self._chunk_cb   = None
         self._silence_ct = 0
@@ -391,60 +360,26 @@ class AudioRecorder:
     def set_chunk_callback(self, fn):
         self._chunk_cb = fn
 
-    def prewarm(self):
-        """Open a silent input stream immediately on launch.
-        This forces Bluetooth HFP negotiation to happen now,
-        so when the user presses the hotkey the mic is already live."""
-        try:
-            with self._lock:
-                # Don't disturb an active recording, and don't race with a
-                # concurrent start() that's opening the recording stream.
-                if self._active:
-                    return
-                if self._warmup:
-                    try: self._warmup.stop(); self._warmup.close()
-                    except Exception: pass
-                    self._warmup = None
-                # device=None always uses whatever macOS currently has as default input
-                # This correctly picks AirPods if they're set in System Settings -> Sound -> Input
-                info = sd.query_devices(None, 'input')
-                print(f"[voicepad] mic pre-warmed: {info['name']}")
-                self._warmup = sd.InputStream(
-                    samplerate=SAMPLE_RATE, channels=CHANNELS,
-                    dtype=DTYPE, callback=self._warmup_cb, blocksize=512, device=None)
-                self._warmup.start()
-        except Exception as e:
-            print(f"[voicepad] prewarm failed ({e}) — mic will have slight delay")
-
-    def _warmup_cb(self, indata, *_):
-        # discard all audio — we just need the stream open
-        pass
-
     def start(self):
         with self._lock:
             self._frames = []; self._silence_ct = 0
             self._speaking = False; self._active = True
-            # close warmup stream before refreshing PortAudio
-            if self._warmup:
-                try: self._warmup.stop(); self._warmup.close()
-                except Exception: pass
-                self._warmup = None
             # Refresh PortAudio's device cache. PortAudio enumerates devices
             # once at Pa_Initialize, so after AirPods (or any input) drops and
-            # rejoins, device=None still resolves to the stale handle and
-            # recordings come up empty until the process is restarted.
+            # rejoins, stale indices/handles linger and recordings come up
+            # empty until the process is restarted.
             try:
                 sd._terminate(); sd._initialize()
             except Exception as e:
                 print(f"[voicepad] PortAudio refresh failed ({e})")
+            dev = resolve_input_device()
             try:
-                info = sd.query_devices(None, 'input')
+                info = sd.query_devices(dev, 'input')
                 print(f"[voicepad] recording: {info['name']}")
             except Exception:
                 pass
-            # device=None = always use current macOS default input (AirPods, built-in, etc)
             self._stream = sd.InputStream(samplerate=SAMPLE_RATE, channels=CHANNELS,
-                dtype=DTYPE, callback=self._cb, blocksize=512, device=None)
+                dtype=DTYPE, callback=self._cb, blocksize=512, device=dev)
             self._stream.start()
 
     def _cb(self, indata, *_):
@@ -473,8 +408,8 @@ class AudioRecorder:
         return audio
 
     def stop(self):
-        # Detach the stream under the lock so prewarm() can't race with us,
-        # but DO NOT hold the lock through stream.stop(). PortAudio's
+        # Detach the stream under the lock, but DO NOT hold the lock
+        # through stream.stop(). PortAudio's
         # stop() blocks until the in-flight _cb returns, and _cb itself
         # acquires self._lock — holding it here would deadlock the audio
         # thread against the main thread, which presents as the process
@@ -494,8 +429,7 @@ class AudioRecorder:
             else:
                 audio = np.array([], dtype=DTYPE)
             self._frames = []; self._silence_ct = 0; self._speaking = False
-        # re-open warmup stream so next recording has no delay
-        threading.Thread(target=self.prewarm, daemon=True).start()
+        # mic is now fully closed — nothing is reopened until the next start()
         return audio
 
     def rms(self):
@@ -514,7 +448,6 @@ if HAVE_APPKIT:
             if self is None: return None
             self.wave_vals = [0.0] * BARS
             self.dot_state = DOT_STATE_IDLE
-            self.mode_idx  = 0
             self.drag_pt   = None
             self.anim_tick = 0
             return self
@@ -540,9 +473,8 @@ if HAVE_APPKIT:
                 RADIUS, RADIUS)
             ns_c(*BG).setFill()
             path.fill()
-            mode = MODES[self.mode_idx]
-            ns_c(*MODE_RIM[mode]).setStroke()
-            path.setLineWidth_(1.0 if mode == "raw" else 2.0)
+            ns_c(*BORDER).setStroke()
+            path.setLineWidth_(1.0)
             path.stroke()
             if self.dot_state == DOT_STATE_IDLE:
                 self.vp_draw_dots()
@@ -588,8 +520,8 @@ if HAVE_APPKIT:
         def set_wave(self, v):
             self.wave_vals = v; self.setNeedsDisplay_(True)
 
-        def set_state(self, dot, mode):
-            self.dot_state = dot; self.mode_idx = mode
+        def set_state(self, dot):
+            self.dot_state = dot
             self.setNeedsDisplay_(True)
 
     class AppKitUI(NSObject):
@@ -702,7 +634,7 @@ if HAVE_APPKIT:
         def q_show(self):          self._q.put(("show",)); self._pump()
         def q_hide(self):          self._q.put(("hide",)); self._pump()
         def q_wave(self, v):       self._q.put(("wave", v))
-        def q_dot(self, d, m):     self._q.put(("dot", d, m)); self._pump()
+        def q_dot(self, d):        self._q.put(("dot", d)); self._pump()
 
         def tick_(self, _):
             while True:
@@ -726,7 +658,7 @@ if HAVE_APPKIT:
                         self.win.orderFrontRegardless()
                     elif cmd == "hide": self.win.orderOut_(None)
                     elif cmd == "wave": self.view.set_wave(msg[1])
-                    elif cmd == "dot":  self.view.set_state(msg[1], msg[2])
+                    elif cmd == "dot":  self.view.set_state(msg[1])
                 except Exception as e:
                     print(f"[voicepad] ui cmd {msg[0]} failed: {e}")
             try:
@@ -803,7 +735,6 @@ else:
             self._q        = queue.Queue()
             self.wave_vals = [0.0] * FB_BARS
             self.dot_state = DOT_STATE_IDLE
-            self.mode_idx  = 0
             self._dx = self._dy = 0
             self._ctrl_ref = None
             self._build(); self._place(); self._poll()
@@ -823,9 +754,6 @@ else:
             self.dot = tk.Label(bot, text="■", font=("Helvetica", 9),
                                 fg="#52525A", bg="#1C1C20")
             self.dot.pack(side="left", padx=(0,5))
-            self.mode_lbl = tk.Label(bot, text="Default",
-                                     font=("Helvetica", 10), fg="#B8B8BC", bg="#1C1C20")
-            self.mode_lbl.pack(side="left")
             self.root.geometry(f"{self.BW}x{self.BH}")
 
         def _drag(self, e):
@@ -846,10 +774,9 @@ else:
                     elif cmd == "hide": self.root.withdraw()
                     elif cmd == "wave": self.wave_vals = msg[1]; self._draw()
                     elif cmd == "dot":
-                        self.dot_state = msg[1]; self.mode_idx = msg[2]
+                        self.dot_state = msg[1]
                         c = {"rec":"#EB4040","done":"#38D068"}.get(msg[1],"#52525A")
                         self.dot.config(fg=c)
-                        self.mode_lbl.config(text=MODE_SHORT[MODES[msg[2]]])
             except queue.Empty: pass
             self.root.after(30, self._poll)
 
@@ -869,7 +796,7 @@ else:
         def q_show(self):      self._q.put(("show",))
         def q_hide(self):      self._q.put(("hide",))
         def q_wave(self, v):   self._q.put(("wave", v))
-        def q_dot(self, d, m): self._q.put(("dot", d, m))
+        def q_dot(self, d):    self._q.put(("dot", d))
         def run(self):         self.root.mainloop()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -886,45 +813,36 @@ class VoicePad:
         self.recorder    = AudioRecorder()
         self.recorder.set_chunk_callback(self._on_silence_chunk)
         self._state      = "idle"
-        self._mode       = 0
-        self._raw        = ""
         self._transcript = []
         self._chunk_lock = threading.Lock()
         self._smooth     = [0.0] * BARS
         self._targets    = [0.0] * BARS
 
     def _on_press(self, key):
-        if key == kb_input.Key.cmd_r:
+        if key == HOTKEY:
             if self._state == "idle":        self._start()
             elif self._state == "recording": self._stop()
-            # ignore cmd_r during processing — prevents ghost triggers on wake
+            # ignore the hotkey during processing — prevents ghost triggers on wake
             return
         if key == kb_input.Key.esc:
             self._cancel()   # dismiss in any state
             return
-        # Tab is handled exclusively by CGEventTap (_install_tab_tap)
-        # Do NOT handle it here — would cause double-cycle
 
     def _on_release(self, key):
         pass
 
     def _start(self):
         self._state = "recording"
-        self._raw   = ""
         with self._chunk_lock:
             self._transcript = []
-        # auto-detect context and switch mode silently
-        detected = detect_context_mode()
-        if detected is not None:
-            self._mode = detected
         self.ui.q_show()
-        self.ui.q_dot(DOT_STATE_REC, self._mode)
+        self.ui.q_dot(DOT_STATE_REC)
         self.recorder.start()
         threading.Thread(target=self._wave_loop, daemon=True).start()
 
     def _stop(self):
         self._state = "processing"
-        self.ui.q_dot(DOT_STATE_IDLE, self._mode)
+        self.ui.q_dot(DOT_STATE_IDLE)
         audio = self.recorder.stop()
         threading.Thread(target=self._finalize, args=(audio,), daemon=True).start()
 
@@ -936,19 +854,8 @@ class VoicePad:
             pass
         self._state = "idle"
         self.ui.q_wave([0.0] * BARS)
-        self.ui.q_dot(DOT_STATE_IDLE, self._mode)
+        self.ui.q_dot(DOT_STATE_IDLE)
         self.ui.q_hide()
-
-    def _cycle_mode(self):
-        self._switch_mode((self._mode + 1) % len(MODES))
-
-    def _switch_mode(self, idx):
-        self._mode = idx
-        self.ui.q_dot(
-            DOT_STATE_REC if self._state == "recording" else DOT_STATE_IDLE,
-            idx)
-        if self._raw and self._state == "idle":
-            threading.Thread(target=self._reprocess, daemon=True).start()
 
     def _on_silence_chunk(self, audio):
         if audio.size < SAMPLE_RATE * 0.3:
@@ -967,26 +874,14 @@ class VoicePad:
         with self._chunk_lock:
             full_text = " ".join(self._transcript).strip()
         if not full_text:
-            self.ui.q_dot(DOT_STATE_IDLE, self._mode)
+            self.ui.q_dot(DOT_STATE_IDLE)
             time.sleep(0.3); self._state = "idle"; self.ui.q_hide(); return
-        self._raw = full_text
         self._deliver(full_text)
 
-    def _reprocess(self):
-        self._state = "processing"
-        self.ui.q_show()
-        self._deliver(self._raw)
-
     def _deliver(self, raw):
-        mode = MODES[self._mode]
-        if mode != "raw":
-            self.ui.q_dot(DOT_STATE_IDLE, self._mode)
-            result = ollama_post(raw, mode)
-        else:
-            result = raw
-        pyperclip.copy(result)
+        pyperclip.copy(raw)
         paste_to_frontmost()
-        self.ui.q_dot(DOT_STATE_DONE, self._mode)
+        self.ui.q_dot(DOT_STATE_DONE)
         self._state = "idle"
         threading.Thread(target=self._autohide, daemon=True).start()
 
@@ -994,7 +889,7 @@ class VoicePad:
         time.sleep(AUTOHIDE_SEC)
         if self._state == "idle":
             self.ui.q_wave([0.0] * BARS)
-            self.ui.q_dot(DOT_STATE_IDLE, self._mode)
+            self.ui.q_dot(DOT_STATE_IDLE)
             self.ui.q_hide()
 
     def _wave_loop(self):
@@ -1027,48 +922,69 @@ class VoicePad:
             time.sleep(0.033)
         self.ui.q_wave([0.0] * BARS)
 
-    def _install_tab_tap(self):
-        """Install a CGEventTap ONLY for Tab suppression.
-        Everything else (cmd_r, esc) still handled by pynput."""
-        if not HAVE_QUARTZ:
-            return
-        TAB_KEYCODE = 48
-        pad = self
-
-        def cb(proxy, etype, event, refcon):
-            try:
-                kc = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
-                if kc == TAB_KEYCODE and etype == kCGEventKeyDown:
-                    if pad.ui.is_visible():
-                        pad._cycle_mode()
-                        return None   # suppress — Chrome never sees it
-            except Exception:
-                pass
-            return event   # pass everything else through
-
-        tap = CGEventTapCreate(
-            kCGSessionEventTap, kCGHeadInsertEventTap, 0,
-            (1 << kCGEventKeyDown),
-            cb, None)
-        if tap is None:
-            print("[voicepad] CGEventTap failed — check Accessibility. Tab will pass through.")
-            return
-        src = CFMachPortCreateRunLoopSource(None, tap, 0)
-        CFRunLoopAddSource(CFRunLoopGetMain(), src, kCFRunLoopCommonModes)
-        CGEventTapEnable(tap, True)
-        print("[voicepad] Tab suppression active")
-
     def run(self):
         threading.Thread(target=load_transcription_model, daemon=True).start()
-        threading.Thread(target=self.recorder.prewarm, daemon=True).start()
-        # pynput handles cmd_r and esc as before
         listener = kb_input.Listener(
             on_press=self._on_press, on_release=self._on_release)
         listener.daemon = True; listener.start()
-        # CGEventTap only for tab suppression, runs on AppKit main loop
-        self._install_tab_tap()
-        print("[voicepad] Right Cmd=record | Tab=mode (visible only) | Esc=cancel")
+        print(f"[voicepad] {CONFIG['hotkey']}=record | Esc=cancel")
         self.ui.run()
 
+# ── launchd keep-alive (replaces Hammerspoon) ─────────────────────────────────
+LAUNCH_AGENT_LABEL = "com.voicepad.agent"
+LAUNCH_AGENT_PATH  = os.path.expanduser(
+    f"~/Library/LaunchAgents/{LAUNCH_AGENT_LABEL}.plist")
+
+def _launch_agent_program():
+    if os.environ.get('RESOURCEPATH'):
+        # running inside the .app bundle — point launchd at the bundle binary
+        contents = os.path.dirname(os.environ['RESOURCEPATH'])
+        return [os.path.join(contents, 'MacOS', 'VoicePad')]
+    return [sys.executable, os.path.abspath(__file__)]
+
+def install_launch_agent():
+    args = "\n".join(f"    <string>{p}</string>"
+                     for p in _launch_agent_program())
+    plist = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>             <string>{LAUNCH_AGENT_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+{args}
+  </array>
+  <key>RunAtLoad</key>         <true/>
+  <key>KeepAlive</key>         <true/>
+  <key>StandardOutPath</key>   <string>/tmp/voicepad.log</string>
+  <key>StandardErrorPath</key> <string>/tmp/voicepad.log</string>
+</dict>
+</plist>
+"""
+    os.makedirs(os.path.dirname(LAUNCH_AGENT_PATH), exist_ok=True)
+    with open(LAUNCH_AGENT_PATH, "w") as f:
+        f.write(plist)
+    subprocess.run(["launchctl", "unload", LAUNCH_AGENT_PATH],
+                   capture_output=True)
+    subprocess.run(["launchctl", "load", LAUNCH_AGENT_PATH],
+                   capture_output=True)
+    print(f"[voicepad] launch agent installed: {LAUNCH_AGENT_PATH}")
+    print("[voicepad] VoicePad now starts at login and restarts if it exits.")
+    print("[voicepad] Remove any Hammerspoon keep-alive to avoid double launches.")
+
+def uninstall_launch_agent():
+    subprocess.run(["launchctl", "unload", LAUNCH_AGENT_PATH],
+                   capture_output=True)
+    try:
+        os.remove(LAUNCH_AGENT_PATH)
+    except FileNotFoundError:
+        pass
+    print("[voicepad] launch agent removed")
+
 if __name__ == "__main__":
+    if "--install-agent" in sys.argv:
+        install_launch_agent(); sys.exit(0)
+    if "--uninstall-agent" in sys.argv:
+        uninstall_launch_agent(); sys.exit(0)
     VoicePad().run()

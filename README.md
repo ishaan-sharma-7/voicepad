@@ -1,17 +1,16 @@
 # VoicePad
 
-A lightweight macOS voice-dictation overlay powered by [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Apple Silicon) with optional LLM post-processing via [Ollama](https://ollama.com).
+A lightweight macOS voice-dictation overlay powered by [mlx-whisper](https://github.com/ml-explore/mlx-examples/tree/main/whisper) (Apple Silicon), with optional offloading to a shared transcription server on your LAN.
 
-Press **Right ⌘** to start/stop recording. Text is transcribed locally, optionally cleaned up by a local LLM, and pasted directly into whatever app is in focus.
+Press the trigger key (default **Right ⌘**) to start/stop recording. Text is transcribed and pasted directly into whatever app is in focus.
 
 ## Privacy
 
-VoicePad never stores or transmits your audio.
+The microphone is **opt-in**: no audio stream exists except between your start and stop keypresses. There is no warmup stream, no background listening — when you're not dictating, the mic is closed.
 
-- **Warmup stream** — to eliminate the lag when switching Bluetooth audio devices (e.g. AirPods) into recording mode, VoicePad keeps a silent microphone stream open at all times. Every audio chunk from this stream is immediately discarded in memory — it is never written to disk, never buffered, and never leaves your machine.
-- **Recording** — audio is only actively captured while you hold Right ⌘. The raw PCM data lives in RAM for the duration of transcription, then is released.
-- **Transcription** — runs entirely on-device via Apple's MLX framework. No audio or text is sent to any external server.
-- **LLM post-processing** — if enabled, the transcript is sent to a local [Ollama](https://ollama.com) instance running on your machine. Nothing leaves localhost.
+- **Recording** — audio is captured only between trigger-key presses. The raw PCM lives in RAM for the duration of transcription, then is released. Nothing is written to disk.
+- **Transcription** — by default, runs entirely on-device via Apple's MLX framework. If you configure a remote server (see below), audio is sent to that server — keep it LAN-only or behind Tailscale.
+- **Output** — the transcript goes to your clipboard and is pasted into the frontmost app. No history is stored.
 
 ---
 
@@ -19,138 +18,174 @@ VoicePad never stores or transmits your audio.
 
 | Requirement | Notes |
 |---|---|
-| macOS 12+ | AppKit UI; Quartz event tap for Tab suppression |
-| Apple Silicon (M1/M2/M3) | Required for `mlx-whisper`; see fallback below |
+| macOS 12+ | AppKit overlay UI |
+| Apple Silicon (M1+) | Required for `mlx-whisper`; see fallback below |
 | Python 3.10+ | Uses `int \| None` union syntax |
-| [Ollama](https://ollama.com) | Only needed for Email / Notes / Math modes |
 
-> **No Apple Silicon?** The app automatically falls back to `faster-whisper` on CPU. Install it with `pip install faster-whisper` and remove `mlx-whisper` from `requirements.txt`.
+> **No Apple Silicon?** The app automatically falls back to `faster-whisper` on CPU (`pip install faster-whisper`), or point `transcribe_url` at a server that has Apple Silicon.
 
 ---
 
 ## Installation
 
 ```bash
-# 1. Clone the repo
-git clone https://github.com/your-username/voicepad.git
+git clone https://github.com/maslowtechnologies/voicepad.git
 cd voicepad
-
-# 2. Create and activate a virtual environment
 python3 -m venv venv
 source venv/bin/activate
-
-# 3. Install dependencies
 pip install -r requirements.txt
-
-# 4. (Optional) Pull an Ollama model for post-processing modes
-ollama pull qwen2.5:14b   # or any model you prefer
+python voicepad.py
 ```
 
-### Accessibility permission
+### Permissions
 
-VoicePad uses a CGEventTap to intercept the **Tab** key (for mode cycling) without letting it reach other apps. macOS requires Accessibility access for this.
+1. **Microphone** — prompted on first recording.
+2. **Accessibility / Input Monitoring** (System Settings → Privacy & Security) — add your terminal (or the `.app` bundle). Needed for the global hotkey and for auto-paste.
 
-1. Open **System Settings → Privacy & Security → Accessibility**
-2. Add your terminal emulator (e.g. Terminal, iTerm2, Warp) or the Python binary
+### Start at login (no Hammerspoon needed)
 
-If you skip this step, Tab will still cycle modes but will also be forwarded to the active app.
+```bash
+python voicepad.py --install-agent
+```
+
+This writes a `launchd` LaunchAgent (`~/Library/LaunchAgents/com.voicepad.agent.plist`) with `KeepAlive`, so VoicePad starts at login and restarts automatically if it ever exits. Run with `--uninstall-agent` to remove it. If you previously used a Hammerspoon keep-alive, delete that snippet first or you'll get duplicate instances.
 
 ---
 
 ## Usage
 
-```bash
-source venv/bin/activate
-python voicepad.py
-```
-
 | Key | Action |
 |---|---|
-| **Right ⌘** | Start / stop recording |
-| **Tab** *(while overlay visible)* | Cycle transcription mode |
+| **Right ⌘** (configurable) | Start / stop recording |
 | **Esc** | Cancel and dismiss |
 
-The overlay appears at the bottom-center of your screen while recording. When you stop, the transcribed (and optionally processed) text is copied to the clipboard and pasted into the frontmost window.
-
----
-
-## Transcription modes
-
-| Mode | What it does |
-|---|---|
-| **Default** | Raw Whisper output — no LLM post-processing |
-| **Email** | Cleans up grammar and structures as a short email body |
-| **Notes** | Converts to bullet-point notes |
-| **Math** | Converts spoken math to LaTeX |
-
-VoicePad also auto-detects context: if **Apple Notes** is focused it switches to Notes mode; if **Gmail** is open in Chrome it switches to Email mode.
+The pill overlay appears at the bottom-center of your screen while recording. When you stop, the transcript is copied to the clipboard and pasted into the frontmost window.
 
 ---
 
 ## Configuration
 
-All tunable constants are at the top of `voicepad.py`:
-
-```python
-OLLAMA_URL   = "http://localhost:11434/api/generate"
-OLLAMA_MODEL = "qwen2.5:14b"      # any model pulled in Ollama
-MLX_MODEL    = "mlx-community/whisper-small.en-mlx"  # see model options below
-AUTOHIDE_SEC = 1.2                # seconds before overlay hides after pasting
-```
-
-### MLX Whisper model options
-
-Larger models are more accurate but slower. All are English-only `.en` variants unless noted.
-
-| Model | Size | Notes |
-|---|---|---|
-| `mlx-community/whisper-tiny.en-mlx` | ~75 MB | Fastest; lower accuracy |
-| `mlx-community/whisper-base.en-mlx` | ~145 MB | Good balance |
-| `mlx-community/whisper-small.en-mlx` | ~465 MB | **Default** |
-| `mlx-community/whisper-medium.en-mlx` | ~1.5 GB | Higher accuracy |
-| `mlx-community/whisper-large-v3-mlx` | ~3 GB | Best accuracy; multilingual |
-
-Models are downloaded automatically from Hugging Face on first use.
-
-### Custom vocabulary / name corrections
-
-Whisper sometimes mishears proper nouns, names, or jargon. Edit `DEFAULT_VOCAB` in `voicepad.py` (or the hot-reloaded file at `~/.voicepad/vocab.json`) to add your own corrections:
+`~/.voicepad/config.json` is created with defaults on first run:
 
 ```json
 {
-  "jon": "John",
-  "jon doe": "John Doe",
-  "api": "API",
-  "github": "GitHub"
+  "hotkey": "cmd_r",
+  "input_device": "builtin",
+  "transcribe_url": "",
+  "local_fallback": true,
+  "mlx_model": "mlx-community/whisper-small.en-mlx"
 }
 ```
 
-The vocab file is hot-reloaded on every transcription — no restart needed.
+- **hotkey** — any [pynput key name](https://pynput.readthedocs.io/en/latest/keyboard.html#pynput.keyboard.Key) (`cmd_r`, `alt_r`, `f19`, …) or a single character.
+- **input_device** — `"builtin"` (default) records from the Mac's internal mic even when AirPods are connected: it opens instantly (no Bluetooth HFP negotiation, which matters now that the mic only opens on demand) and sounds better than the HFP telephone codec. `"default"` follows the system input device instead; expect the first words to be clipped while a Bluetooth mic renegotiates.
+- **transcribe_url** — empty for local transcription, or your transcription server's URL, e.g. `http://macmini.local:8765/transcribe`. Remote failures fall back to local transcription.
+- **local_fallback** — set `false` for a thin client that never loads a local model (no ~500 MB download, no RAM cost) and depends entirely on the server.
+- **mlx_model** — local model. Options: `whisper-tiny.en-mlx` (~75 MB), `whisper-base.en-mlx` (~145 MB), `whisper-small.en-mlx` (~465 MB, default), `whisper-medium.en-mlx` (~1.5 GB), `whisper-large-v3-mlx` (~3 GB), all under `mlx-community/`. Downloaded from Hugging Face on first use.
+
+Restart VoicePad after editing config.json.
+
+### Custom vocabulary / name corrections
+
+Whisper sometimes mishears proper nouns, names, or jargon. Add corrections to `~/.voicepad/vocab.json`:
+
+```json
+{
+  "eshon": "Ishaan",
+  "cloud code": "Claude Code",
+  "slash loop": "/loop"
+}
+```
+
+Matching is case-insensitive on word boundaries, longest phrase first. The file is hot-reloaded on every transcription — no restart needed.
+
+---
+
+## Shared transcription server (Mac Mini)
+
+Instead of every laptop running its own Whisper model, run one big model on a shared machine and point every client at it. The server holds the model resident in memory, so requests are fast, and clients become thin (no model download, no RAM cost).
+
+```
+┌──────────────┐  audio (HTTP POST /transcribe)   ┌───────────────────────┐
+│  VoicePad     │ ───────────────────────────────▶ │  Mac Mini              │
+│  (your Mac)   │ ◀─────────────────────────────── │  whisper-large-v3      │
+└──────────────┘            text                   └───────────────────────┘
+```
+
+### On the Mac Mini
+
+```bash
+git clone https://github.com/maslowtechnologies/voicepad.git
+cd voicepad/server
+python3 -m venv venv && source venv/bin/activate
+pip install -r requirements.txt
+python transcribe_server.py        # serves on 0.0.0.0:8765, loads whisper-large-v3
+```
+
+To keep it running across reboots, create `~/Library/LaunchAgents/com.voicepad.server.plist`:
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>             <string>com.voicepad.server</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/path/to/voicepad/server/venv/bin/python</string>
+    <string>/path/to/voicepad/server/transcribe_server.py</string>
+  </array>
+  <key>RunAtLoad</key>         <true/>
+  <key>KeepAlive</key>         <true/>
+  <key>StandardOutPath</key>   <string>/tmp/voicepad-server.log</string>
+  <key>StandardErrorPath</key> <string>/tmp/voicepad-server.log</string>
+</dict>
+</plist>
+```
+
+then `launchctl load ~/Library/LaunchAgents/com.voicepad.server.plist`.
+
+Model and port are overridable via `VOICEPAD_MODEL` and `VOICEPAD_PORT` env vars. The server never writes audio to disk and never logs transcripts. Keep it on the LAN (or Tailscale) — there is no auth layer.
+
+### On each client
+
+Edit `~/.voicepad/config.json`:
+
+```json
+{
+  "transcribe_url": "http://macmini.local:8765/transcribe",
+  "local_fallback": false
+}
+```
+
+(`local_fallback: true` keeps a local model as a backup for when you're off the office network.)
+
+Sanity check from a client: `curl http://macmini.local:8765/health`
+
+Vocabulary corrections stay client-side — each person's `vocab.json` is applied to the text the server returns.
 
 ---
 
 ## How it works
 
-1. **Recording** — `sounddevice` streams audio from the default macOS input at 16 kHz.
-2. **Silence detection** — chunks are flushed automatically when silence is detected (configurable RMS threshold).
-3. **Transcription** — `mlx_whisper.transcribe()` runs on-device via Apple's MLX framework (no network, no API key).
-4. **Post-processing** — if a non-raw mode is active, the transcript is sent to a local Ollama instance with a mode-specific system prompt.
-5. **Paste** — result is written to the clipboard and pasted via AppleScript `keystroke "v" using {command down}`.
+1. **Recording** — on the trigger key, `sounddevice` opens the configured input at 16 kHz. PortAudio's device cache is refreshed on every start so Bluetooth devices that dropped and rejoined are picked up.
+2. **Silence detection** — chunks are flushed for transcription automatically as you pause (configurable RMS threshold), so long dictations transcribe incrementally.
+3. **Transcription** — remote server if configured (raw float32 PCM over HTTP), else `mlx_whisper` on-device. Hallucination filtering and vocab corrections are applied client-side.
+4. **Paste** — the result is written to the clipboard and pasted via AppleScript `keystroke "v"`.
 
 ---
 
 ## Standalone `.app` bundle (optional)
 
-If you'd rather install VoicePad as a regular macOS app — no menu-bar `Python` entry, no Cmd+Tab listing, no dependency on whatever Python your shell happens to resolve — you can build a self-contained `.app` from the included [setup.py](setup.py).
-
-**Why bother:** the bundle has its own embedded Python interpreter and only ships voicepad's actual dependencies. If your system Python's site-packages is "polluted" with something that misbehaves at process exit (e.g. `llama-cpp-python` whose `libggml-metal` destructor calls `abort()` and produces a *Python quit unexpectedly* dialog every time the process is killed), the bundle is fully insulated from it.
+If you'd rather install VoicePad as a regular macOS app — no terminal, no dependency on whatever Python your shell happens to resolve — build a self-contained `.app` from the included [setup.py](setup.py).
 
 ```bash
 # Build environment — use a fresh venv, py2app needs a working pip
 python3.11 -m venv /tmp/voicepad-build
 /tmp/voicepad-build/bin/pip install -r requirements.txt py2app
 
-# Build (produces dist/VoicePad.app, ~1 GB)
+# Build (produces dist/VoicePad.app)
 /tmp/voicepad-build/bin/python setup.py py2app
 
 # Install to ~/Applications and ad-hoc-sign so macOS will run it
@@ -159,87 +194,12 @@ cp -R dist/VoicePad.app ~/Applications/
 codesign --force --deep --sign - ~/Applications/VoicePad.app
 ```
 
-First launch will prompt for **Microphone** and **Accessibility** access — grant both. The bundle is registered as `com.voicepad.app` (a separate identity from a raw Python script), so any earlier permissions granted to "Python" don't carry over.
+First launch prompts for **Microphone** and **Accessibility** access. `Info.plist` sets `LSUIElement=YES` so the app is hidden from the Dock, menu bar, and Cmd+Tab — it just shows the floating pill when you press the trigger key.
 
-`Info.plist` sets `LSUIElement=YES` so the app is hidden from the Dock, menu bar, and Cmd+Tab — it just shows the floating panel when you press Right ⌘.
-
----
-
-## Auto-launch on login (optional)
-
-VoicePad runs fine by launching it manually in a terminal. If you want it to start automatically on login, pick one of the options below.
-
-### Option 1: launchd plist (no third-party dependencies)
-
-Create `~/Library/LaunchAgents/com.voicepad.plist`:
-
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>             <string>com.voicepad</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/path/to/voicepad/venv/bin/python</string>
-    <string>/path/to/voicepad/voicepad.py</string>
-  </array>
-  <key>RunAtLoad</key>         <true/>
-  <key>KeepAlive</key>         <true/>
-  <key>StandardOutPath</key>   <string>/tmp/voicepad.log</string>
-  <key>StandardErrorPath</key> <string>/tmp/voicepad.log</string>
-</dict>
-</plist>
-```
-
-Replace both `/path/to/voicepad` entries with your actual paths, then load it:
+To auto-start the bundle at login, run the inner binary once with the agent flag:
 
 ```bash
-launchctl load ~/Library/LaunchAgents/com.voicepad.plist
-```
-
-`KeepAlive` means launchd will automatically restart VoicePad if it ever crashes.
-
-### Option 2: Hammerspoon (if you already use it)
-
-If you have [Hammerspoon](https://www.hammerspoon.org) installed, add this to your `~/.hammerspoon/init.lua`:
-
-```lua
--- Auto-launch VoicePad on login and restart it if it exits
-local voicepadTask = nil
-
-local function startVoicePad()
-  voicepadTask = hs.task.new(
-    "/path/to/voicepad/venv/bin/python",
-    function(exitCode, stdOut, stdErr)
-      -- Restart on exit (e.g. crash)
-      hs.timer.doAfter(2, startVoicePad)
-    end,
-    { "/path/to/voicepad/voicepad.py" }
-  )
-  voicepadTask:start()
-end
-
-startVoicePad()
-```
-
-Replace both `/path/to/voicepad` entries with your actual paths and reload your Hammerspoon config.
-
-If you built the `.app` bundle (see above), point Hammerspoon at its inner binary instead:
-
-```lua
-local function startVoicePad()
-  hs.task.new(
-    "/Users/yourname/Applications/VoicePad.app/Contents/MacOS/VoicePad",
-    function(exitCode, stdOut, stdErr)
-      hs.timer.doAfter(3, startVoicePad)
-    end,
-    {}
-  ):start()
-end
-
-startVoicePad()
+~/Applications/VoicePad.app/Contents/MacOS/VoicePad --install-agent
 ```
 
 ---
