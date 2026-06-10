@@ -89,13 +89,18 @@ try:
         NSMakeRect, NSMakePoint,
         NSBackingStoreBuffered, NSWindowStyleMaskBorderless,
         NSFloatingWindowLevel, NSStatusWindowLevel, NSPopUpMenuWindowLevel,
+        NSScreenSaverWindowLevel,
         NSNonactivatingPanelMask,
         NSPanel, NSWindowCollectionBehaviorCanJoinAllSpaces,
         NSWindowCollectionBehaviorStationary,
         NSWindowCollectionBehaviorFullScreenAuxiliary,
-        NSTimer, NSScreen, NSWorkspace,
+        NSTimer, NSScreen, NSWorkspace, NSEvent,
     )
-    from Foundation import NSObject, NSNotificationCenter
+    from Foundation import (
+        NSObject, NSNotificationCenter, NSProcessInfo, NSPointInRect,
+        NSRunLoop, NSRunLoopCommonModes,
+        NSActivityUserInitiatedAllowingIdleSystemSleep, NSActivityLatencyCritical,
+    )
     HAVE_APPKIT = True
 except Exception as e:
     print(f"[voicepad] AppKit unavailable ({e}), using tkinter")
@@ -108,9 +113,9 @@ DTYPE        = "float32"
 OLLAMA_URL   = "http://localhost:11434/api/generate"
 OLLAMA_MODEL = "gemma4:e2b"   # Any model you have pulled; gemma4:e2b is small and fast
 MLX_MODEL    = "mlx-community/whisper-small.en-mlx"
-AUTOHIDE_SEC = 1.2
+AUTOHIDE_SEC = 0.3
 
-MODES      = ["raw", "email", "notes", "math"]
+MODES      = ["raw", "email", "notes"]
 
 # ── vocab config ──────────────────────────────────────────────────────────────
 import json, re
@@ -202,7 +207,7 @@ def detect_context_mode() -> int | None:
             return MODES.index("email")
 
     return None
-MODE_SHORT = {"raw": "Default", "email": "Email", "notes": "Notes", "math": "Math"}
+MODE_SHORT = {"raw": "Default", "email": "Email", "notes": "Notes"}
 
 SYSTEM_PROMPTS = {
     "raw": None,
@@ -244,62 +249,30 @@ SYSTEM_PROMPTS = {
         "* Buy milk\n"
         "* Buy eggs\n"
     ),
-    "math": (
-        "Convert dictated math to LaTeX. Output ONLY wrapped LaTeX — no prose, no code fences, no explanation.\n\n"
-        "WRAPPING (CRITICAL — every output MUST be wrapped):\n"
-        "  - Use $...$ for short expressions with no fractions, integrals, sums, products, limits, derivatives, matrices, or multi-line systems.\n"
-        "  - Use $$...$$ for everything else.\n"
-        "  - NEVER output bare LaTeX without $ or $$ wrappers.\n\n"
-        "Translation cheatsheet:\n"
-        "  \"x squared\" → x^2 ;  \"x to the n\" → x^n\n"
-        "  \"alpha/beta/pi/theta/...\" → \\alpha, \\beta, \\pi, \\theta\n"
-        "  \"a over b\" → \\frac{a}{b}\n"
-        "  \"square root of x\" → \\sqrt{x}\n"
-        "  \"integral from a to b of f dx\" → \\int_a^b f\\,dx\n"
-        "  \"sum from i=1 to n of f\" → \\sum_{i=1}^{n} f\n"
-        "  \"limit as x approaches L of f\" → \\lim_{x \\to L} f\n"
-        "  \"derivative of f with respect to x\" → \\frac{df}{dx}\n\n"
-        "Examples:\n"
-        "  Input: x plus y\n"
-        "  Output: $x + y$\n\n"
-        "  Input: x squared plus y squared equals r squared\n"
-        "  Output: $x^2 + y^2 = r^2$\n\n"
-        "  Input: alpha plus beta equals pi over two\n"
-        "  Output: $$\\alpha + \\beta = \\frac{\\pi}{2}$$\n\n"
-        "  Input: integral from zero to infinity of e to the minus x dx\n"
-        "  Output: $$\\int_0^\\infty e^{-x}\\,dx$$\n\n"
-        "  Input: sum from i equals 1 to n of i equals n times n plus 1 over 2\n"
-        "  Output: $$\\sum_{i=1}^{n} i = \\frac{n(n+1)}{2}$$\n\n"
-        "  Input: limit as x approaches infinity of one over x equals zero\n"
-        "  Output: $$\\lim_{x \\to \\infty} \\frac{1}{x} = 0$$\n\n"
-        "  Input: two x plus three y equals seven and four x minus y equals two\n"
-        "  Output: $$2x + 3y = 7$$\n          $$4x - y = 2$$\n\n"
-        "Now convert the user's input. Output only the wrapped LaTeX."
-    ),
 }
 
 # ── window geometry ───────────────────────────────────────────────────────────
-W        = 480
-WAVE_H   = 54
-BOTTOM_H = 34
-H        = WAVE_H + BOTTOM_H
-RADIUS   = 12
-BARS     = 32
+# Small Wispr-Flow-style pill: just a waveform inside a rounded capsule.
+W        = 148
+H        = 36
+RADIUS   = (H - 3) / 2   # full capsule (accounting for the 1.5px rim inset)
+BARS     = 16
 
 # ── palette ───────────────────────────────────────────────────────────────────
 BG       = (0.11,  0.11,  0.125, 0.96)
-BORDER   = (0.24,  0.24,  0.27,  0.8)
-DIV      = (0.22,  0.22,  0.25,  0.6)
+BORDER   = (0.30,  0.30,  0.34,  0.8)
 WAVE_A   = (0.86,  0.86,  0.88,  1.0)
 WAVE_D   = (0.19,  0.19,  0.21,  1.0)
-DOT_GREY = (0.32,  0.32,  0.36,  1.0)
-DOT_RED  = (0.92,  0.25,  0.25,  1.0)
+DOT_GREY = (0.55,  0.55,  0.60,  1.0)
 DOT_GRN  = (0.22,  0.82,  0.46,  1.0)
-TEXT     = (0.72,  0.72,  0.76,  1.0)
-TEXT_DIM = (0.36,  0.36,  0.40,  1.0)
-KEY_BG   = (0.22,  0.22,  0.26,  1.0)
-KEY_FG   = (0.82,  0.82,  0.86,  1.0)
-SEP      = (0.28,  0.28,  0.32,  0.8)
+
+# Mode → rim color. Memorize the mode by the capsule's outline:
+#   default = no color (subtle gray), email = blue, notes = yellow
+MODE_RIM = {
+    "raw":   BORDER,
+    "email": (0.36, 0.58, 0.98, 0.95),
+    "notes": (0.95, 0.78, 0.25, 0.95),
+}
 
 DOT_STATE_IDLE = "idle"
 DOT_STATE_REC  = "rec"
@@ -559,125 +532,58 @@ if HAVE_APPKIT:
         def mouseUp_(self, _): self.drag_pt = None
 
         def drawRect_(self, rect):
+            # Capsule background with a mode-colored rim. Inset so the rim
+            # stroke isn't clipped at the view edge.
+            inset = 1.5
+            path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
+                NSMakeRect(inset, inset, W - inset * 2, H - inset * 2),
+                RADIUS, RADIUS)
             ns_c(*BG).setFill()
-            bg_path = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                NSMakeRect(0, 0, W, H), RADIUS, RADIUS)
-            bg_path.fill()
-            ns_c(*BORDER).setStroke()
-            bg_path.setLineWidth_(0.75)
-            bg_path.stroke()
-            self.vp_draw_waveform()
-            ns_c(*DIV).setStroke()
-            d = NSBezierPath.bezierPath()
-            d.moveToPoint_(NSMakePoint(0, WAVE_H))
-            d.lineToPoint_(NSMakePoint(W, WAVE_H))
-            d.setLineWidth_(0.5)
-            d.stroke()
-            self.vp_draw_bottom()
+            path.fill()
+            mode = MODES[self.mode_idx]
+            ns_c(*MODE_RIM[mode]).setStroke()
+            path.setLineWidth_(1.0 if mode == "raw" else 2.0)
+            path.stroke()
+            if self.dot_state == DOT_STATE_IDLE:
+                self.vp_draw_dots()
+            else:
+                self.vp_draw_waveform()
 
         def vp_draw_waveform(self):
-            pad   = 18
+            pad   = 16
             avail = W - pad * 2
             slot  = avail / BARS
-            bw    = max(2.0, slot * 0.44)
-            ym    = WAVE_H / 2
+            bw    = max(2.0, slot * 0.46)
+            ym    = H / 2
+            done  = (self.dot_state == DOT_STATE_DONE)
             for i, v in enumerate(self.wave_vals):
                 x  = pad + i * slot + slot / 2
-                hh = max(2.5, v * (WAVE_H - 12) * 0.96)
-                col = ns_c(*WAVE_A) if v > 0.07 else ns_c(*WAVE_D)
+                hh = max(2.5, v * (H - 14) * 0.95)
+                if done:
+                    col = ns_c(*DOT_GRN)
+                else:
+                    col = ns_c(*WAVE_A) if v > 0.07 else ns_c(*WAVE_D)
                 col.setFill()
                 r = min(bw / 2, hh / 2, 3.0)
                 NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
                     NSMakeRect(x - bw / 2, ym - hh / 2, bw, hh), r, r).fill()
 
-        def vp_draw_bottom(self):
-            strip_mid = WAVE_H + BOTTOM_H / 2
-            ty = strip_mid - 7
-            dy = strip_mid - 4.5
-            x  = 14.0
-
-            is_proc = (self.dot_state == DOT_STATE_IDLE)
-
-            if is_proc:
-                # three bouncing dots animation
-                dot_r   = 2.8
-                spacing = 7.5
-                self.anim_tick += 1
-                for di in range(3):
-                    phase  = (self.anim_tick - di * 7) % 21
-                    rise   = max(0.0, math.sin(phase / 21.0 * math.pi))
-                    alpha  = 0.30 + 0.55 * rise
-                    offset = rise * 3.5
-                    ns_c(DOT_GREY[0], DOT_GREY[1], DOT_GREY[2], alpha).setFill()
-                    cx = x + di * spacing + dot_r
-                    cy = dy + dot_r - offset
-                    NSBezierPath.bezierPathWithOvalInRect_(
-                        NSMakeRect(cx - dot_r, cy - dot_r,
-                                   dot_r * 2, dot_r * 2)).fill()
-                x += 3 * spacing + 6
-            elif self.dot_state == DOT_STATE_REC:
-                ns_c(*DOT_RED).setFill()
-                NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                    NSMakeRect(x, dy, 8.0, 8.0), 2.2, 2.2).fill()
-                x += 8.0 + 8
-            else:
-                ns_c(*DOT_GRN).setFill()
-                NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                    NSMakeRect(x, dy, 8.0, 8.0), 2.2, 2.2).fill()
-                x += 8.0 + 8
-
-            lbl   = "Recording"  if self.dot_state == DOT_STATE_REC  else \
-                    "Done"       if self.dot_state == DOT_STATE_DONE else \
-                    "Processing"
-            lbl_c = ns_c(*TEXT) if self.dot_state == DOT_STATE_REC else ns_c(*TEXT_DIM)
-            self.vp_txt(lbl, x, ty, NSFont.systemFontOfSize_(11), lbl_c)
-            x += self.vp_tw(lbl, NSFont.systemFontOfSize_(11)) + 12
-            x  = self.vp_sep(x, ty)
-
-            mode_lbl = MODE_SHORT[MODES[self.mode_idx]]
-            self.vp_txt(mode_lbl, x, ty, NSFont.systemFontOfSize_(11), ns_c(*TEXT))
-            x += self.vp_tw(mode_lbl, NSFont.systemFontOfSize_(11)) + 5
-            x  = self.vp_keycap("Tab", x, ty) + 12
-            x  = self.vp_sep(x, ty)
-
-            self.vp_txt("Stop", x, ty, NSFont.systemFontOfSize_(11), ns_c(*TEXT))
-            x += self.vp_tw("Stop", NSFont.systemFontOfSize_(11)) + 5
-            x  = self.vp_keycap("Cmd", x, ty) + 12
-            x  = self.vp_sep(x, ty)
-
-            self.vp_txt("Cancel", x, ty, NSFont.systemFontOfSize_(11), ns_c(*TEXT))
-            x += self.vp_tw("Cancel", NSFont.systemFontOfSize_(11)) + 5
-            self.vp_keycap("Esc", x, ty)
-
-        def vp_txt(self, s, x, y, font, color):
-            NSString.stringWithString_(s).drawAtPoint_withAttributes_(
-                NSMakePoint(x, y),
-                {NSFontAttributeName: font,
-                 NSForegroundColorAttributeName: color})
-
-        def vp_tw(self, s, font):
-            return NSString.stringWithString_(s).sizeWithAttributes_(
-                {NSFontAttributeName: font}).width
-
-        def vp_keycap(self, label, x, y):
-            font = NSFont.monospacedSystemFontOfSize_weight_(9, 0.3)
-            tw   = self.vp_tw(label, font)
-            kw   = tw + 10; kh = 16; kr = 3.5; ky = y + 1
-            ns_c(*KEY_BG).setFill()
-            ns_c(0.35, 0.35, 0.40, 0.7).setStroke()
-            cap = NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(
-                NSMakeRect(x, ky, kw, kh), kr, kr)
-            cap.fill(); cap.setLineWidth_(0.5); cap.stroke()
-            self.vp_txt(label, x + 5, ky + 2, font, ns_c(*KEY_FG))
-            return x + kw
-
-        def vp_sep(self, x, y):
-            ns_c(*SEP).setStroke()
-            p = NSBezierPath.bezierPath()
-            p.moveToPoint_(NSMakePoint(x, y - 1))
-            p.lineToPoint_(NSMakePoint(x, y + 13))
-            p.setLineWidth_(0.5); p.stroke()
-            return x + 9
+        def vp_draw_dots(self):
+            # three bouncing dots, centered — "processing"
+            dot_r   = 2.8
+            spacing = 9.0
+            cx0     = W / 2 - spacing
+            self.anim_tick += 1
+            for di in range(3):
+                phase  = (self.anim_tick - di * 7) % 21
+                rise   = max(0.0, math.sin(phase / 21.0 * math.pi))
+                alpha  = 0.30 + 0.55 * rise
+                cx = cx0 + di * spacing
+                cy = H / 2 - rise * 3.0
+                ns_c(DOT_GREY[0], DOT_GREY[1], DOT_GREY[2], alpha).setFill()
+                NSBezierPath.bezierPathWithOvalInRect_(
+                    NSMakeRect(cx - dot_r, cy - dot_r,
+                               dot_r * 2, dot_r * 2)).fill()
 
         def set_wave(self, v):
             self.wave_vals = v; self.setNeedsDisplay_(True)
@@ -690,26 +596,43 @@ if HAVE_APPKIT:
         def init(self):
             self = objc.super(AppKitUI, self).init()
             if self is None: return None
-            self._q    = queue.Queue()
-            self._ctrl = None
+            self._q      = queue.Queue()
+            self._ctrl   = None
+            self._tick_n = 0
             return self
 
+        def _panel_screen(self):
+            # The screen the user is actually looking at — the one with the
+            # mouse cursor. mainScreen() for a background app with no key
+            # window is just screens()[0], so on multi-monitor setups the
+            # panel could appear on a display the user wasn't watching.
+            try:
+                mouse = NSEvent.mouseLocation()
+                for s in NSScreen.screens():
+                    if NSPointInRect(mouse, s.frame()):
+                        return s
+            except Exception:
+                pass
+            return NSScreen.mainScreen() or NSScreen.screens()[0]
+
         def _panel_origin(self):
-            # visibleFrame() excludes menu bar / Dock; origin includes the
-            # screen's global offset, so multi-monitor setups (and post-
-            # unplug/replug states) place the panel on the correct screen
-            # rather than off in dead space — which presented as the panel
-            # being "behind everything".
-            sf = NSScreen.mainScreen().visibleFrame()
+            # Hug the very bottom edge of the screen, centered — Wispr Flow
+            # style. frame() (not visibleFrame) so the pill sits flush with
+            # the physical bottom; at our window level it floats above the
+            # Dock anyway. Origin includes the screen's global offset so
+            # multi-monitor setups place it on the correct screen.
+            sf = self._panel_screen().frame()
             x  = sf.origin.x + (sf.size.width - W) / 2
-            y  = sf.origin.y + 90
+            y  = sf.origin.y + 4
             return NSMakePoint(x, y)
 
         def _apply_window_traits(self):
-            # NSPopUpMenuWindowLevel (101) is reliably above fullscreen-app
-            # contents on every macOS version we care about; NSStatusWindowLevel
-            # (25) was sometimes covered by fullscreen Chrome.
-            self.win.setLevel_(NSPopUpMenuWindowLevel)
+            # NSScreenSaverWindowLevel (1000) sits above pop-up menus and
+            # every normal app window. NSPopUpMenuWindowLevel (101) was still
+            # occasionally topped by other windows at the same level (menus,
+            # pickers, some overlay apps), and NSStatusWindowLevel (25) was
+            # covered by fullscreen Chrome.
+            self.win.setLevel_(NSScreenSaverWindowLevel)
             self.win.setCollectionBehavior_(
                 NSWindowCollectionBehaviorCanJoinAllSpaces |
                 NSWindowCollectionBehaviorStationary |
@@ -767,15 +690,30 @@ if HAVE_APPKIT:
             try: return bool(self.win.isVisible())
             except: return False
 
-        def q_show(self):          self._q.put(("show",))
-        def q_hide(self):          self._q.put(("hide",))
+        def _pump(self):
+            # Drain the queue on the main thread NOW instead of waiting for
+            # the next 33ms timer tick. App Nap defers background-app timers
+            # by seconds (or indefinitely), which is exactly when the panel
+            # "didn't pop up" after switching windows — the show command was
+            # sitting in the queue waiting for a napped timer.
+            self.performSelectorOnMainThread_withObject_waitUntilDone_(
+                "tick:", None, False)
+
+        def q_show(self):          self._q.put(("show",)); self._pump()
+        def q_hide(self):          self._q.put(("hide",)); self._pump()
         def q_wave(self, v):       self._q.put(("wave", v))
-        def q_dot(self, d, m):     self._q.put(("dot", d, m))
+        def q_dot(self, d, m):     self._q.put(("dot", d, m)); self._pump()
 
         def tick_(self, _):
-            try:
-                while True:
-                    msg = self._q.get_nowait(); cmd = msg[0]
+            while True:
+                try:
+                    msg = self._q.get_nowait()
+                except queue.Empty:
+                    break
+                # Isolate each message: one failure (e.g. a transient screen
+                # error during display reconfig) must not eat a queued show.
+                try:
+                    cmd = msg[0]
                     if cmd == "show":
                         # orderOut first so the WindowServer fully re-evaluates
                         # stacking/Space membership on re-show. Re-asserting on
@@ -789,11 +727,21 @@ if HAVE_APPKIT:
                     elif cmd == "hide": self.win.orderOut_(None)
                     elif cmd == "wave": self.view.set_wave(msg[1])
                     elif cmd == "dot":  self.view.set_state(msg[1], msg[2])
-            except queue.Empty: pass
-            # keep bottom bar animating while processing
+                except Exception as e:
+                    print(f"[voicepad] ui cmd {msg[0]} failed: {e}")
             try:
-                if self.view.dot_state == DOT_STATE_IDLE and self.win.isVisible():
-                    self.view.setNeedsDisplay_(True)
+                self._tick_n += 1
+                if self.win.isVisible():
+                    # keep bottom bar animating while processing
+                    if self.view.dot_state == DOT_STATE_IDLE:
+                        self.view.setNeedsDisplay_(True)
+                    # Watchdog: re-assert level + ordering ~1x/sec while
+                    # visible. orderFrontRegardless on a non-activating panel
+                    # never steals focus, so this is free insurance against
+                    # anything ordering itself above us mid-recording.
+                    if self._tick_n % 30 == 0:
+                        self._apply_window_traits()
+                        self.win.orderFrontRegardless()
             except Exception:
                 pass
 
@@ -816,9 +764,25 @@ if HAVE_APPKIT:
             # on AE Quit — this is the path the libggml-metal abort travels
             # through (see crash trace: _handleAEQuit → terminate: → exit).
             app.setDelegate_(self)
+            # Opt out of App Nap. As a windowless LSUIElement agent we're a
+            # prime nap candidate the moment the user is in another app —
+            # napping defers our NSTimer (the only thing that drains the UI
+            # queue) so the panel showed late or not at all. LatencyCritical
+            # marks our timers as real-time; AllowingIdleSystemSleep keeps us
+            # from blocking the machine's normal sleep. The token must stay
+            # referenced or the assertion is dropped.
+            self._activity = NSProcessInfo.processInfo(
+            ).beginActivityWithOptions_reason_(
+                NSActivityUserInitiatedAllowingIdleSystemSleep |
+                NSActivityLatencyCritical,
+                "VoicePad hotkey must show the panel instantly")
             self._make_window()
-            NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+            timer = NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
                 0.033, self, "tick:", None, True)
+            # Common modes so the timer keeps firing during event tracking
+            # (e.g. while the user drags the panel) — default-mode-only
+            # timers stall there and freeze the waveform/queue.
+            NSRunLoop.mainRunLoop().addTimer_forMode_(timer, NSRunLoopCommonModes)
             app.run()
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1004,7 +968,7 @@ class VoicePad:
             full_text = " ".join(self._transcript).strip()
         if not full_text:
             self.ui.q_dot(DOT_STATE_IDLE, self._mode)
-            time.sleep(0.6); self._state = "idle"; self.ui.q_hide(); return
+            time.sleep(0.3); self._state = "idle"; self.ui.q_hide(); return
         self._raw = full_text
         self._deliver(full_text)
 
