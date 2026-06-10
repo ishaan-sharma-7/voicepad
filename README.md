@@ -116,37 +116,12 @@ Instead of every laptop running its own Whisper model, run one big model on a sh
 
 ```bash
 git clone https://github.com/maslowtechnologies/voicepad.git
-cd voicepad/server
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-python transcribe_server.py        # serves on 0.0.0.0:8765, loads whisper-large-v3
+./voicepad/server/install.sh
 ```
 
-To keep it running across reboots, create `~/Library/LaunchAgents/com.voicepad.server.plist`:
+That's the whole setup: the script creates a venv, installs dependencies, registers a `launchd` KeepAlive agent (starts at boot, restarts on crash, logs to `/tmp/voicepad-server.log`), waits for the model download, and prints the URL to give clients.
 
-```xml
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
-  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>             <string>com.voicepad.server</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>/path/to/voicepad/server/venv/bin/python</string>
-    <string>/path/to/voicepad/server/transcribe_server.py</string>
-  </array>
-  <key>RunAtLoad</key>         <true/>
-  <key>KeepAlive</key>         <true/>
-  <key>StandardOutPath</key>   <string>/tmp/voicepad-server.log</string>
-  <key>StandardErrorPath</key> <string>/tmp/voicepad-server.log</string>
-</dict>
-</plist>
-```
-
-then `launchctl load ~/Library/LaunchAgents/com.voicepad.server.plist`.
-
-Model and port are overridable via `VOICEPAD_MODEL` and `VOICEPAD_PORT` env vars. The server never writes audio to disk and never logs transcripts. Keep it on the LAN (or Tailscale) — there is no auth layer.
+To run manually instead: `python transcribe_server.py` (serves on `0.0.0.0:8765`, loads `whisper-large-v3`). Model and port are overridable via `VOICEPAD_MODEL` and `VOICEPAD_PORT` env vars. The server never writes audio to disk and never logs transcripts. Keep it on the LAN (or Tailscale) — there is no auth layer.
 
 ### On each client
 
