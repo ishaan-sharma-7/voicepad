@@ -656,14 +656,25 @@ if HAVE_APPKIT:
                         self.win.setFrameOrigin_(self._panel_origin())
                         self._apply_window_traits()
                         self.win.orderFrontRegardless()
-                    elif cmd == "hide": self.win.orderOut_(None)
+                    elif cmd == "hide":
+                        # Drop stale hides. _autohide/_finalize threads check
+                        # state then enqueue hide; a new recording can start
+                        # between the check and the enqueue, leaving the queue
+                        # as [show, hide] — the hide buries the fresh panel
+                        # while the mic keeps recording ("it hears me but no
+                        # pill"). State is only trustworthy here, on the main
+                        # thread, where commands are processed in order.
+                        if self._ctrl is None or self._ctrl._state == "idle":
+                            self.win.orderOut_(None)
                     elif cmd == "wave": self.view.set_wave(msg[1])
                     elif cmd == "dot":  self.view.set_state(msg[1])
                 except Exception as e:
                     print(f"[voicepad] ui cmd {msg[0]} failed: {e}")
             try:
                 self._tick_n += 1
-                if self.win.isVisible():
+                visible = self.win.isVisible()
+                busy = self._ctrl is not None and self._ctrl._state != "idle"
+                if visible:
                     # keep bottom bar animating while processing
                     if self.view.dot_state == DOT_STATE_IDLE:
                         self.view.setNeedsDisplay_(True)
@@ -674,6 +685,14 @@ if HAVE_APPKIT:
                     if self._tick_n % 30 == 0:
                         self._apply_window_traits()
                         self.win.orderFrontRegardless()
+                elif busy:
+                    # Self-heal: recording/processing but the panel is hidden
+                    # — a show was eaten (transient AppKit error during screen
+                    # reconfig) or buried by a stale hide. Re-show every tick
+                    # until it sticks; once visible this branch stops running.
+                    self.win.setFrameOrigin_(self._panel_origin())
+                    self._apply_window_traits()
+                    self.win.orderFrontRegardless()
             except Exception:
                 pass
 
@@ -771,13 +790,23 @@ else:
                 while True:
                     msg = self._q.get_nowait(); cmd = msg[0]
                     if cmd == "show":   self.root.deiconify(); self.root.lift()
-                    elif cmd == "hide": self.root.withdraw()
+                    elif cmd == "hide":
+                        # Drop stale hides (see AppKitUI.tick_): a hide
+                        # enqueued just as a new recording started must not
+                        # bury the fresh show.
+                        if self._ctrl_ref is None or self._ctrl_ref._state == "idle":
+                            self.root.withdraw()
                     elif cmd == "wave": self.wave_vals = msg[1]; self._draw()
                     elif cmd == "dot":
                         self.dot_state = msg[1]
                         c = {"rec":"#EB4040","done":"#38D068"}.get(msg[1],"#52525A")
                         self.dot.config(fg=c)
             except queue.Empty: pass
+            # Self-heal: recording/processing but hidden — re-show until it
+            # sticks (mirrors the AppKit watchdog).
+            if (self._ctrl_ref is not None and self._ctrl_ref._state != "idle"
+                    and not self.is_visible()):
+                self.root.deiconify(); self.root.lift()
             self.root.after(30, self._poll)
 
         def _draw(self):

@@ -43,6 +43,13 @@ is the shared transcription server that runs on the office Mac Mini.
 - The panel re-asserts window level/ordering on a watchdog tick and on
   screen-reconfig and wake notifications — flakiness here historically
   required a process restart.
+- Show/hide race: `_autohide`/`_finalize` check controller state on a
+  background thread, then enqueue a hide — a new recording can start in
+  between, leaving [show, stale-hide] in the UI queue and burying the pill
+  mid-recording. Hide commands are therefore re-validated against
+  `_ctrl._state` on the main thread when processed, and the watchdog
+  re-shows the panel whenever state != idle but the window isn't visible.
+  Don't remove either guard; the enqueue-side checks alone are racy.
 - App Nap: the process holds an NSActivity assertion (`LatencyCritical`);
   without it the UI queue timer gets deferred and the panel shows late or never.
 - Whisper hallucinates on silence ("thanks for watching", repeated words) —
